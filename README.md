@@ -29,12 +29,14 @@ data is per-instance and resets on redeploy.
 | GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`) / create escrow contracts |
 | GET | `/api/v1/contracts/:id` | Get a contract |
 | POST | `/api/v1/contracts/:id/deposit` | `{ "amount": 100 }` |
+| POST | `/api/v1/contracts/:id/extend-deadline` | `{ "client": "G...", "fundingDeadline": "2026-01-15T00:00:00.000Z" }` |
 | POST | `/api/v1/contracts/:id/milestones/:index/release` | Release a milestone |
 | POST | `/api/v1/contracts/:id/dispute` | `{ "raisedBy": "G...", "reason": "..." }` |
 | POST | `/api/v1/contracts/:id/resolve` | `{ "freelancerBps": 5000 }` |
 | POST | `/api/v1/contracts/:id/cancel` | Cancel and refund |
 | POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` |
 | GET | `/api/v1/reputation/:address` | Freelancer reputation |
+| GET/POST | `/api/cron/expire-contracts` | Authenticated daily sweep of due unfunded contracts |
 
 ## Development
 
@@ -47,7 +49,10 @@ npm run build && npm start
 ```
 
 Configuration (all optional, see `.env.example`): `PORT`, `ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`,
-`STELLAR_RPC_URL`, `FRONTEND_URL`.
+`STELLAR_RPC_URL`, `FRONTEND_URL`, `CRON_SECRET` (required to authenticate
+`GET`/`POST /api/cron/expire-contracts`). New contracts default to a funding deadline 14 days after
+creation; explicit deadlines must be between one hour and 90 days in the future. The daily Vercel cron
+sweep expires only still-unfunded contracts. A client can extend a deadline through the endpoint above.
 
 ## Deployment
 
