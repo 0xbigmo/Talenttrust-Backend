@@ -5,6 +5,20 @@ import compression from 'compression';
 import { config, explorerUrl } from './config';
 import { EscrowStore, HttpError } from './store';
 import { openapi, docsHtml } from './openapi';
+import { validate } from './validation/middleware';
+import {
+  IdParam,
+  MilestoneIndexParam,
+  MilestoneReleaseParams,
+  CreateContractBody,
+  DepositBody,
+  DisputeBody,
+  ResolveBody,
+  RateBody,
+  CancelBody,
+  ListQuery,
+  ReputationAddressParam,
+} from './validation/schemas';
 import { parseFieldSpec, project } from './utils/project';
 import { createLogger, type Logger, randomUUID } from './logger';
 import { ChainReader, SorobanRpcChainReader } from './chain';
@@ -222,14 +236,15 @@ export function createApp(
   v1.get('/stats', wrap(() => store.stats()));
   v1.get(
     '/contracts',
+    validate({ query: ListQuery }),
     wrap((req) => {
       let linked: boolean | undefined = undefined;
       if (req.query.linked === 'true') linked = true;
       else if (req.query.linked === 'false') linked = false;
       const spec = parseFields(req);
       const contracts = store.list({
-        status: typeof req.query.status === 'string' ? req.query.status : undefined,
-        party: typeof req.query.party === 'string' ? req.query.party : undefined,
+        status: req.query.status as string | undefined,
+        party: req.query.party as string | undefined,
         linked,
       });
       return { data: contracts.map((c) => project(c, spec)) };
@@ -237,13 +252,15 @@ export function createApp(
   );
   v1.post(
     '/contracts',
+    validate({ body: CreateContractBody }),
     wrap((req, res) => {
-      res.status(201).json(store.create(req.body ?? {}));
+      res.status(201).json(store.create(req.body));
     }),
   );
   v1.get(
     '/contracts/:id',
-    wrap((req) => project(store.get(id(req)), parseFields(req))),
+    validate({ params: IdParam }),
+    wrap((req) => project(store.get(Number(req.params.id)), parseFields(req))),
   );
   v1.patch('/contracts/:id', wrap((req) => store.edit(id(req), req.body ?? {})));
   v1.delete(
@@ -254,18 +271,41 @@ export function createApp(
     }),
   );
   v1.get('/contracts/:id/revisions', wrap((req) => store.getRevisions(id(req))));
-  v1.post('/contracts/:id/deposit', wrap((req) => store.deposit(id(req), req.body?.amount)));
+  v1.post(
+    '/contracts/:id/deposit',
+    validate({ params: IdParam, body: DepositBody }),
+    wrap((req) => store.deposit(Number(req.params.id), req.body.amount)),
+  );
   v1.post(
     '/contracts/:id/milestones/:index/release',
-    wrap((req) => store.release(id(req), Number(req.params.index))),
+    validate({ params: MilestoneReleaseParams }),
+    wrap((req) => store.release(Number(req.params.id), Number(req.params.index))),
   );
   v1.post(
     '/contracts/:id/dispute',
-    wrap((req) => store.openDispute(id(req), req.body?.raisedBy, req.body?.reason)),
+    validate({ params: IdParam, body: DisputeBody }),
+    wrap((req) => store.openDispute(Number(req.params.id), req.body.raisedBy, req.body.reason)),
   );
-  v1.post('/contracts/:id/resolve', wrap((req) => store.resolveDispute(id(req), req.body?.freelancerBps)));
-  v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
-  v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
+  v1.post(
+    '/contracts/:id/resolve',
+    validate({ params: IdParam, body: ResolveBody }),
+    wrap((req) => store.resolveDispute(Number(req.params.id), req.body.freelancerBps)),
+  );
+  v1.post(
+    '/contracts/:id/cancel',
+    validate({ params: IdParam, body: CancelBody }),
+    wrap((req) => store.cancel(Number(req.params.id))),
+  );
+  v1.post(
+    '/contracts/:id/reputation',
+    validate({ params: IdParam, body: RateBody }),
+    wrap((req) => store.rate(Number(req.params.id), req.body.rating)),
+  );
+  v1.get(
+    '/reputation/:address',
+    validate({ params: ReputationAddressParam }),
+    wrap((req) => store.getReputationWithClient(req.params.address)),
+  );
   v1.post(
     '/contracts/:id/reviews',
     wrap((req, res) => {
@@ -280,7 +320,6 @@ export function createApp(
     '/contracts/:id/parity',
     wrap(async (req) => store.checkParity(id(req), chainReader)),
   );
-  v1.get('/reputation/:address', wrap((req) => store.getReputationWithClient(req.params.address)));
   v1.get(
     '/reputation/:address/reviews',
     wrap((req) => {

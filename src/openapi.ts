@@ -9,11 +9,65 @@ const errorResponse = (description: string, schema: object = { $ref: '#/componen
   description,
   content: json(schema),
 });
-const idParam = { name: 'id', in: 'path', required: true, schema: { type: 'integer' } };
+const created = (description: string, schema: object = { type: 'object' }) => ({
+  201: { description, content: json(schema) },
+});
+
+const validationErrorResponse = {
+  400: {
+    description: 'Validation failed',
+    content: json({ $ref: '#/components/schemas/ValidationError' }),
+  },
+};
+
+const errorResponses = {
+  400: {
+    description: 'Validation failed',
+    content: json({ $ref: '#/components/schemas/ValidationError' }),
+  },
+  403: {
+    description: 'Forbidden',
+    content: json({ $ref: '#/components/schemas/ErrorResponse' }),
+  },
+  404: {
+    description: 'Not found',
+    content: json({ $ref: '#/components/schemas/ErrorResponse' }),
+  },
+  409: {
+    description: 'Conflict',
+    content: json({ $ref: '#/components/schemas/ErrorResponse' }),
+  },
+  500: {
+    description: 'Internal error',
+    content: json({ $ref: '#/components/schemas/ErrorResponse' }),
+  },
+};
+
+const idParam = {
+  name: 'id',
+  in: 'path',
+  required: true,
+  schema: { type: 'string', pattern: '^[1-9][0-9]{0,15}$' },
+  description: 'Contract ID (positive integer)',
+};
+const indexParam = {
+  name: 'index',
+  in: 'path',
+  required: true,
+  schema: { type: 'string', pattern: '^(?:[0-9]|1[0-9])$' },
+  description: 'Milestone index (0-19)',
+};
+const addressParam = {
+  name: 'address',
+  in: 'path',
+  required: true,
+  schema: { type: 'string', minLength: 1 },
+  description: 'Stellar address',
+};
 const contractRef = { $ref: '#/components/schemas/EscrowContract' };
-const addressParam = { name: 'address', in: 'path', required: true, schema: { type: 'string' } };
 const reviewRef = { $ref: '#/components/schemas/Review' };
 const errorRef = { $ref: '#/components/schemas/ErrorResponse' };
+const reputationRef = { $ref: '#/components/schemas/Reputation' };
 
 /**
  * `?fields=` query parameter shared by GET /contracts and GET /contracts/:id.
@@ -98,8 +152,8 @@ const spec = {
           'Use `?fields=` to request a sparse response — only the listed fields are included, ' +
           'reducing payload size for list views.',
         parameters: [
-          { name: 'status', in: 'query', schema: { type: 'string' } },
-          { name: 'party', in: 'query', schema: { type: 'string' }, description: 'Client or freelancer address' },
+          { name: 'status', in: 'query', schema: { type: 'string', enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'] } },
+          { name: 'party', in: 'query', schema: { type: 'string', maxLength: 64 }, description: 'Client or freelancer address' },
           fieldsParam,
           { name: 'linked', in: 'query', schema: { type: 'boolean' }, description: 'Filter by whether contract is linked to on-chain escrow' },
         ],
@@ -221,8 +275,8 @@ const spec = {
       post: {
         tags: ['Contracts'],
         summary: 'Release a milestone payment to the freelancer',
-        parameters: [idParam, { name: 'index', in: 'path', required: true, schema: { type: 'integer' } }],
-        responses: ok('Updated contract', contractRef),
+        parameters: [idParam, indexParam],
+        responses: { 200: { description: 'Updated contract', content: json(contractRef) }, ...errorResponses },
       },
     },
     '/api/v1/contracts/{id}/dispute': {
@@ -230,23 +284,21 @@ const spec = {
         tags: ['Contracts'],
         summary: 'Open a dispute',
         parameters: [idParam],
-        requestBody: {
-          content: json({ type: 'object', properties: { raisedBy: { type: 'string' }, reason: { type: 'string' } } }),
-        },
-        responses: ok('Updated contract', contractRef),
+        requestBody: { required: true, content: json({ $ref: '#/components/schemas/DisputeRequest' }) },
+        responses: { 200: { description: 'Updated contract', content: json(contractRef) }, ...errorResponses },
       },
     },
     '/api/v1/contracts/{id}/resolve': {
       post: {
         tags: ['Contracts'],
-        summary: 'Resolve a dispute (admin)',
+        summary: 'Resolve a dispute',
         parameters: [idParam],
-        requestBody: { content: json({ type: 'object', properties: { freelancerBps: { type: 'integer' } } }) },
-        responses: ok('Updated contract', contractRef),
+        requestBody: { required: true, content: json({ $ref: '#/components/schemas/ResolveRequest' }) },
+        responses: { 200: { description: 'Updated contract', content: json(contractRef) }, ...errorResponses },
       },
     },
     '/api/v1/contracts/{id}/cancel': {
-      post: { tags: ['Contracts'], summary: 'Cancel and refund', parameters: [idParam], responses: ok('Updated contract', contractRef) },
+      post: { tags: ['Contracts'], summary: 'Cancel and refund', parameters: [idParam], responses: { 200: { description: 'Updated contract', content: json(contractRef) }, ...errorResponses } },
     },
     '/api/v1/contracts/{id}/reputation': {
       post: {
@@ -579,6 +631,88 @@ const spec = {
             },
           },
         },
+      },
+      ValidationError: {
+        type: 'object',
+        properties: {
+          error: { type: 'string', enum: ['validation_failed'] },
+          message: { type: 'string' },
+          details: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                path: { type: 'string' },
+                message: { type: 'string' },
+              },
+              required: ['path', 'message'],
+            },
+          },
+        },
+        required: ['error', 'message', 'details'],
+      },
+      CreateContractRequest: {
+        type: 'object',
+        required: ['client', 'freelancer', 'milestones'],
+        properties: {
+          title: { type: 'string', maxLength: 120 },
+          client: { type: 'string', minLength: 1 },
+          freelancer: { type: 'string', minLength: 1 },
+          token: { type: 'string', maxLength: 64 },
+          milestones: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 20,
+            items: {
+              oneOf: [
+                amountSchema,
+                {
+                  type: 'object',
+                  properties: {
+                    title: { type: 'string', maxLength: 120 },
+                    amount: amountSchema,
+                  },
+                  required: ['amount'],
+                  additionalProperties: false,
+                },
+              ],
+            },
+          },
+        },
+        additionalProperties: false,
+      },
+      DepositRequest: {
+        type: 'object',
+        required: ['amount'],
+        properties: {
+          amount: amountSchema,
+        },
+        additionalProperties: false,
+      },
+      DisputeRequest: {
+        type: 'object',
+        required: ['raisedBy'],
+        properties: {
+          raisedBy: { type: 'string', minLength: 1 },
+          reason: { type: 'string', minLength: 1, maxLength: 1000 },
+        },
+        additionalProperties: false,
+      },
+      ResolveRequest: {
+        type: 'object',
+        required: ['freelancerBps'],
+        properties: {
+          freelancerBps: { type: 'integer', minimum: 0, maximum: 10000 },
+        },
+        additionalProperties: false,
+      },
+      RateRequest: {
+        type: 'object',
+        required: ['rating'],
+        properties: {
+          rating: { type: 'integer', minimum: 1, maximum: 5 },
+        },
+        additionalProperties: false,
       },
     },
   },
