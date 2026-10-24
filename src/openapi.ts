@@ -1,4 +1,5 @@
 import { config, explorerUrl } from './config';
+import { ALLOWED_FIELDS } from './utils/project';
 
 const json = (schema: object) => ({ 'application/json': { schema } });
 const ok = (description: string, schema: object = { type: 'object' }) => ({
@@ -10,6 +11,36 @@ const errorResponse = (description: string, schema: object = { $ref: '#/componen
 });
 const idParam = { name: 'id', in: 'path', required: true, schema: { type: 'integer' } };
 const contractRef = { $ref: '#/components/schemas/EscrowContract' };
+const errorRef = { $ref: '#/components/schemas/ErrorResponse' };
+
+/**
+ * `?fields=` query parameter shared by GET /contracts and GET /contracts/:id.
+ * Clients may request a subset of EscrowContract fields to reduce payload
+ * size.  `id` is always returned.  Use dot notation for milestone sub-fields
+ * (e.g. `milestones.amount`).  Unknown fields yield a 400 error.
+ */
+const fieldsParam = {
+  name: 'fields',
+  in: 'query',
+  required: false,
+  description:
+    'Comma-separated list of fields to include in the response. ' +
+    '`id` is always returned. Use `milestones.amount` style notation for ' +
+    'nested milestone fields. Unknown fields return 400. ' +
+    `Allowed values: ${ALLOWED_FIELDS.join(', ')}.`,
+  schema: {
+    type: 'string',
+    example: 'title,status,totalAmount',
+  },
+};
+
+const fieldsError = {
+  400: {
+    description: 'Invalid `?fields=` value. The response body lists valid field names.',
+    content: json(errorRef),
+  },
+};
+
 const amountSchema = {
   oneOf: [{ type: 'integer', minimum: 1 }, { type: 'string', pattern: '^[1-9][0-9]{0,37}$' }],
   description: 'Amount in token base units. Must be a positive integer.',
@@ -41,7 +72,12 @@ const spec = {
     description:
       'Milestone-based escrow API for freelancers and clients. State mirrors the TalentTrust ' +
       `Soroban escrow contract on Stellar ${config.network} (${config.contractId}). ` +
-      `Explorer: ${explorerUrl()}. Data is held in memory and resets on redeploy.`,
+      `Explorer: ${explorerUrl()}. Data is held in memory and resets on redeploy.\n\n` +
+      '**Response compression**: The API compresses JSON responses ≥ 1 KB with gzip or Brotli ' +
+      'when the client sends an `Accept-Encoding` header. A `Vary: Accept-Encoding` header is ' +
+      'included on compressed responses.\n\n' +
+      '**Sparse fieldsets**: GET /contracts and GET /contracts/:id accept a `?fields=` query ' +
+      'parameter so clients can download only the fields they need.',
   },
   servers: [{ url: '/' }],
   tags: [{ name: 'System' }, { name: 'Contracts' }, { name: 'Reputation' }],
@@ -55,12 +91,20 @@ const spec = {
       get: {
         tags: ['Contracts'],
         summary: 'List escrow contracts',
+        description:
+          'Returns an array of contracts. Supports filtering by `status` or `party` address. ' +
+          'Use `?fields=` to request a sparse response — only the listed fields are included, ' +
+          'reducing payload size for list views.',
         parameters: [
           { name: 'status', in: 'query', schema: { type: 'string' } },
           { name: 'party', in: 'query', schema: { type: 'string' }, description: 'Client or freelancer address' },
+          fieldsParam,
           { name: 'linked', in: 'query', schema: { type: 'boolean' }, description: 'Filter by whether contract is linked to on-chain escrow' },
         ],
-        responses: ok('Contracts', { type: 'object', properties: { data: { type: 'array', items: contractRef } } }),
+        responses: {
+          ...ok('Contracts', { type: 'object', properties: { data: { type: 'array', items: contractRef } } }),
+          ...fieldsError,
+        },
       },
       post: {
         tags: ['Contracts'],
@@ -89,10 +133,13 @@ const spec = {
       get: {
         tags: ['Contracts'],
         summary: 'Get a contract',
-        parameters: [idParam],
+        description:
+          'Returns a single contract by numeric ID. ' +
+          'Use `?fields=` to request only a subset of fields.',
+        parameters: [idParam, fieldsParam],
         responses: {
           ...ok('Contract', contractRef),
-          400: errorResponse('Invalid contract id'),
+          400: errorResponse('Invalid contract id or invalid `?fields=` value'),
           404: errorResponse('Contract not found'),
         },
       },
@@ -402,6 +449,17 @@ const spec = {
           },
           status: { type: 'string', enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'] },
           reputationIssued: { type: 'boolean' },
+          dispute: {
+            type: 'object',
+            nullable: true,
+            properties: {
+              raisedBy: { type: 'string' },
+              reason: { type: 'string' },
+              openedAt: { type: 'string', format: 'date-time' },
+              freelancerBps: { type: 'integer' },
+              resolvedAt: { type: 'string', format: 'date-time' },
+            },
+          },
           chain: { $ref: '#/components/schemas/ChainInfo' },
           revision: { type: 'integer', minimum: 1, description: 'Term revision; increments on every edit.' },
           createdAt: { type: 'string', format: 'date-time' },

@@ -1,9 +1,11 @@
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import compression from 'compression';
 import { config, explorerUrl } from './config';
 import { EscrowStore, HttpError } from './store';
 import { openapi, docsHtml } from './openapi';
+import { parseFieldSpec, project } from './utils/project';
 import { createLogger, type Logger, randomUUID } from './logger';
 import { ChainReader, SorobanRpcChainReader } from './chain';
 import { bigIntReplacer } from './amount';
@@ -41,6 +43,16 @@ const id = (req: Request) => {
   if (!Number.isInteger(n) || n < 1) throw new HttpError(400, 'invalid_id', 'id must be a positive integer');
   return n;
 };
+
+/**
+ * Parse the `?fields=` query param.  Returns `null` when the param is absent
+ * (meaning "return all fields").  Throws {@link HttpError} 400 on invalid input.
+ */
+function parseFields(req: Request) {
+  const raw = req.query.fields;
+  if (typeof raw !== 'string') return null;
+  return parseFieldSpec(raw);
+}
 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
@@ -93,6 +105,24 @@ export function createApp(
 
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors());
+
+  // Compression middleware: gzip/br for JSON responses ≥ 1 KB.
+  // Excluded for text/event-stream and when Cache-Control: no-transform is set.
+  app.use(
+    compression({
+      threshold: 1024, // bytes — skip compression for small responses
+      filter(req, res) {
+        // Honour Cache-Control: no-transform (RFC 7234 §5.2.1.6)
+        const cc = res.getHeader('Cache-Control');
+        if (typeof cc === 'string' && cc.includes('no-transform')) return false;
+        // Never compress streaming responses
+        const ct = res.getHeader('Content-Type');
+        if (typeof ct === 'string' && ct.includes('text/event-stream')) return false;
+        return compression.filter(req, res);
+      },
+    }),
+  );
+
   app.use(express.json({ limit: '100kb' }));
 
   // Structured access log on response finish.
@@ -192,13 +222,13 @@ export function createApp(
       let linked: boolean | undefined = undefined;
       if (req.query.linked === 'true') linked = true;
       else if (req.query.linked === 'false') linked = false;
-      return {
-        data: store.list({
-          status: typeof req.query.status === 'string' ? req.query.status : undefined,
-          party: typeof req.query.party === 'string' ? req.query.party : undefined,
-          linked,
-        }),
-      };
+      const spec = parseFields(req);
+      const contracts = store.list({
+        status: typeof req.query.status === 'string' ? req.query.status : undefined,
+        party: typeof req.query.party === 'string' ? req.query.party : undefined,
+        linked,
+      });
+      return { data: contracts.map((c) => project(c, spec)) };
     }),
   );
   v1.post(
@@ -207,7 +237,10 @@ export function createApp(
       res.status(201).json(store.create(req.body ?? {}));
     }),
   );
-  v1.get('/contracts/:id', wrap((req) => store.get(id(req))));
+  v1.get(
+    '/contracts/:id',
+    wrap((req) => project(store.get(id(req)), parseFields(req))),
+  );
   v1.patch('/contracts/:id', wrap((req) => store.edit(id(req), req.body ?? {})));
   v1.delete(
     '/contracts/:id',

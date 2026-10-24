@@ -26,8 +26,8 @@ data is per-instance and resets on redeploy.
 | GET | `/openapi.json` | OpenAPI 3 spec |
 | GET | `/api/v1/chain` | On-chain contract deployment info |
 | GET | `/api/v1/stats` | Aggregate statistics |
-| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`, `?linked=true\|false`) / create escrow contracts |
-| GET | `/api/v1/contracts/:id` | Get a contract |
+| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`, `?linked=true\|false`, `?fields=`) / create escrow contracts |
+| GET | `/api/v1/contracts/:id` | Get a contract (`?fields=`) |
 | PATCH | `/api/v1/contracts/:id` | Edit an unfunded contract; `{ "client": "G...", "title": "...", "milestones": [{ "title": "...", "amount": 150 }] }` |
 | DELETE | `/api/v1/contracts/:id` | Withdraw an unfunded contract; `{ "client": "G..." }` |
 | GET | `/api/v1/contracts/:id/revisions` | Get contract term revision history |
@@ -41,6 +41,28 @@ data is per-instance and resets on redeploy.
 | GET | `/api/v1/contracts/:id/parity` | Parity check report against on-chain state |
 | GET | `/api/v1/reputation/:address` | Freelancer reputation |
 
+## Sparse fieldsets
+
+GET `/api/v1/contracts` and GET `/api/v1/contracts/:id` accept a `?fields=` query parameter so
+clients can download only the fields they need. `id` is always returned.
+
+```
+GET /api/v1/contracts?fields=title,status,totalAmount
+GET /api/v1/contracts/1?fields=milestones.amount
+```
+
+Allowed top-level fields: `title`, `client`, `freelancer`, `token`, `milestones`, `totalAmount`,
+`totalAmountUnits`, `fundedAmount`, `fundedAmountUnits`, `releasedAmount`, `releasedAmountUnits`,
+`status`, `reputationIssued`, `dispute`, `chain`, `revision`, `createdAt`, `updatedAt`.
+Use dot notation for milestone sub-fields: `milestones.index`, `milestones.title`,
+`milestones.amount`, `milestones.amountUnits`, `milestones.released`. Unknown fields return `400 invalid_fields`.
+
+## Response compression
+
+JSON responses larger than 1 KB are compressed with gzip or Brotli when the client sends
+`Accept-Encoding`. A `Vary: Accept-Encoding` header is set on compressed responses. Responses
+are not compressed when `Cache-Control: no-transform` is present or the content type is
+`text/event-stream`.
 ### Idempotency
 
 Every `POST` under `/api/v1` accepts an optional `Idempotency-Key` header (1-255 printable ASCII
