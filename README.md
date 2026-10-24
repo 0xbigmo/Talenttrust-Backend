@@ -26,6 +26,8 @@ data is per-instance and resets on redeploy.
 | GET | `/openapi.json` | OpenAPI 3 spec |
 | GET | `/api/v1/chain` | On-chain contract deployment info |
 | GET | `/api/v1/stats` | Aggregate statistics |
+| GET | `/api/v1/auth/challenge` | Request a sign challenge (`?address=G…`) |
+| POST | `/api/v1/auth/token` | Exchange a signed challenge for a bearer token |
 | POST | `/api/v1/tx/build` | Build a simulated, unsigned Soroban transaction for a wallet to sign `{ "action": "...", "source": "G…", "args": {} }` |
 | GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`, `?linked=true\|false`, `?fields=`) / create escrow contracts |
 | GET | `/api/v1/contracts/:id` | Get a contract (`?fields=`) |
@@ -100,6 +102,27 @@ status below 500 are kept for 24h (max 10,000 entries, LRU eviction); 5xx respon
 client can retry. Storage is in-memory and per-instance; the `IdempotencyStore` interface in
 `src/idempotency.ts` allows a shared store later.
 
+## Authentication
+
+Mutating routes accept a **bearer token** obtained via the SEP-10-style wallet-signature flow:
+
+1. `GET /api/v1/auth/challenge?address=G…` — receive a short-lived, HMAC-signed challenge string.
+2. Sign the exact challenge string with your Stellar ed25519 private key (base64-encode the signature).
+3. `POST /api/v1/auth/token` with `{ address, challenge, signature }` — receive an HS256 JWT (≤ 1 h).
+4. Send `Authorization: Bearer <token>` on protected routes.
+
+Tokens are **required** on `POST /contracts`, `PATCH`/`DELETE /contracts/:id`, `deposit`, `release`,
+`dispute`, `cancel`, `reputation` and `reviews` when the server runs with `AUTH_SECRET` set (or
+`AUTH_REQUIRED=true`); missing or invalid tokens get `401 unauthorized` with `WWW-Authenticate: Bearer`.
+Without `AUTH_SECRET` the challenge flow uses a random per-process secret and unauthenticated requests keep
+working as before, but a token that is sent is always verified.
+
+For authenticated calls the token subject (`sub`) is the caller's Stellar address and the store enforces the
+same party rules as the on-chain contract: `deposit`, `release`, `cancel`, `reputation` and contract
+edits/withdrawals require the caller to be the contract client (`POST /contracts` forces `client` to the
+caller); `dispute` and `reviews` require the client or freelancer. A body `raisedBy`/`reviewer`/`client` is
+accepted for backwards compatibility but rejected (`403 forbidden`) if it differs from the token subject.
+
 ## Development
 
 ```bash
@@ -111,7 +134,7 @@ npm run build && npm start
 ```
 
 Configuration (all optional, see `.env.example`): `PORT`, `LOG_LEVEL` (debug|info|warn|error|silent, default info; silent in tests),
-`ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`, `STELLAR_RPC_URL`, `STELLAR_NETWORK_PASSPHRASE`, `TX_TIMEOUT_SECONDS`, `FRONTEND_URL`, `IDEMPOTENCY_REQUIRED`.
+`ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`, `STELLAR_RPC_URL`, `STELLAR_NETWORK_PASSPHRASE`, `TX_TIMEOUT_SECONDS`, `FRONTEND_URL`, `IDEMPOTENCY_REQUIRED`, `AUTH_SECRET`, `AUTH_REQUIRED`.
 
 `POST /api/v1/tx/build` assembles an unsigned `invokeHostFunction` transaction against the configured
 escrow contract (`ESCROW_CONTRACT_ID`), simulates it via `STELLAR_RPC_URL`, and returns the assembled XDR

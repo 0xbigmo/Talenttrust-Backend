@@ -133,11 +133,57 @@ const spec = {
       'when the client sends an `Accept-Encoding` header. A `Vary: Accept-Encoding` header is ' +
       'included on compressed responses.\n\n' +
       '**Sparse fieldsets**: GET /contracts and GET /contracts/:id accept a `?fields=` query ' +
-      'parameter so clients can download only the fields they need.',
+      'parameter so clients can download only the fields they need.\n\n' +
+      '**Authentication**: mutating routes accept a bearer token obtained via the auth endpoints. ' +
+      'Call `GET /api/v1/auth/challenge?address=G…`, sign the returned challenge string with your ' +
+      'Stellar ed25519 private key, then `POST /api/v1/auth/token` to receive a short-lived JWT. ' +
+      'Tokens are required when the server runs with `AUTH_SECRET` set (or `AUTH_REQUIRED=true`).',
   },
   servers: [{ url: '/' }],
-  tags: [{ name: 'System' }, { name: 'Contracts' }, { name: 'Reputation' }, { name: 'Transaction' }],
+  tags: [
+    { name: 'System' },
+    { name: 'Auth', description: 'Wallet-signature authentication (SEP-10 style)' },
+    { name: 'Contracts' },
+    { name: 'Reputation' },
+    { name: 'Transaction' },
+  ],
   paths: {
+    '/api/v1/auth/challenge': {
+      get: {
+        tags: ['Auth'],
+        summary: 'Request a sign challenge for a Stellar address',
+        description:
+          'Returns a short-lived HMAC-signed challenge string. ' +
+          'Sign it with the ed25519 private key corresponding to `address` and pass it to `POST /api/v1/auth/token`.',
+        parameters: [
+          {
+            name: 'address',
+            in: 'query',
+            required: true,
+            description: 'Stellar G… ed25519 public key.',
+            schema: { type: 'string' },
+          },
+        ],
+        responses: {
+          ...ok('Challenge issued.', { $ref: '#/components/schemas/ChallengeResponse' }),
+          400: errorResponse('Invalid Stellar address (invalid_address).'),
+        },
+      },
+    },
+    '/api/v1/auth/token': {
+      post: {
+        tags: ['Auth'],
+        summary: 'Exchange a signed challenge for a bearer token',
+        description:
+          'Verifies the HMAC, challenge expiry, address match, and ed25519 signature. ' +
+          'Returns an HS256 JWT (≤ 1 h) to use as `Authorization: Bearer <token>` on protected routes.',
+        requestBody: { required: true, content: json({ $ref: '#/components/schemas/TokenRequest' }) },
+        responses: {
+          ...ok('Token issued.', { $ref: '#/components/schemas/TokenResponse' }),
+          401: errorResponse('invalid_challenge / challenge_expired / challenge_replayed / invalid_signature.'),
+        },
+      },
+    },
     '/health': { get: { tags: ['System'], summary: 'Health check', responses: ok('Service is healthy') } },
     '/api/v1/chain': {
       get: { tags: ['System'], summary: 'On-chain escrow contract deployment info', responses: ok('Deployment') },
@@ -468,6 +514,14 @@ const spec = {
     },
   },
   components: {
+    securitySchemes: {
+      bearerAuth: {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'JWT',
+        description: 'HS256 JWT obtained via POST /api/v1/auth/token after signing a challenge.',
+      },
+    },
     parameters: {
       IdempotencyKey: {
         name: 'Idempotency-Key',
@@ -499,6 +553,32 @@ const spec = {
       },
     },
     schemas: {
+      ChallengeResponse: {
+        type: 'object',
+        required: ['address', 'challenge', 'expiresAt'],
+        properties: {
+          address: { type: 'string' },
+          challenge: { type: 'string', description: 'Sign these exact UTF-8 bytes with the wallet key.' },
+          expiresAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      TokenRequest: {
+        type: 'object',
+        required: ['address', 'challenge', 'signature'],
+        properties: {
+          address: { type: 'string' },
+          challenge: { type: 'string' },
+          signature: { type: 'string', description: 'Base64 ed25519 signature over the challenge string.' },
+        },
+      },
+      TokenResponse: {
+        type: 'object',
+        properties: {
+          token: { type: 'string' },
+          tokenType: { type: 'string', enum: ['Bearer'] },
+          expiresAt: { type: 'string', format: 'date-time' },
+        },
+      },
       DriftItem: {
         type: 'object',
         properties: {
@@ -905,7 +985,36 @@ function withIdempotency<T extends { paths: object }>(doc: T): T {
   return doc;
 }
 
-export const openapi = withIdempotency(spec);
+/** Operations that accept (and, when enabled, require) a wallet bearer token. */
+const PROTECTED: Array<[string, string]> = [
+  ['/api/v1/contracts', 'post'],
+  ['/api/v1/contracts/{id}', 'patch'],
+  ['/api/v1/contracts/{id}', 'delete'],
+  ['/api/v1/contracts/{id}/deposit', 'post'],
+  ['/api/v1/contracts/{id}/milestones/{index}/release', 'post'],
+  ['/api/v1/contracts/{id}/dispute', 'post'],
+  ['/api/v1/contracts/{id}/cancel', 'post'],
+  ['/api/v1/contracts/{id}/reputation', 'post'],
+  ['/api/v1/contracts/{id}/reviews', 'post'],
+];
+
+/** Adds bearerAuth security plus 401/403 responses to every protected operation. */
+function withBearerAuth<T extends { paths: object }>(doc: T): T {
+  const paths = doc.paths as Record<string, Record<string, (Operation & { security?: object[] }) | undefined>>;
+  for (const [path, method] of PROTECTED) {
+    const op = paths[path]?.[method];
+    if (!op) continue;
+    op.security = [{ bearerAuth: [] }];
+    op.responses = {
+      ...op.responses,
+      401: errorResponse('Missing or invalid bearer token.'),
+      403: errorResponse('Authenticated caller is not the required party for this operation.'),
+    };
+  }
+  return doc;
+}
+
+export const openapi = withBearerAuth(withIdempotency(spec));
 
 export const docsHtml = `<!doctype html>
 <html lang="en">

@@ -24,6 +24,11 @@ import { createLogger, type Logger, randomUUID } from './logger';
 import { ChainReader, SorobanRpcChainReader } from './chain';
 import { buildEscrowTransaction, TxBuildError, type RpcClient } from './stellar/escrowTxBuilder';
 import { bigIntReplacer } from './amount';
+import { StrKey, Keypair } from '@stellar/stellar-sdk';
+import { randomBytes } from 'crypto';
+import { buildChallenge, verifyChallenge, consumeNonce } from './auth/challenge';
+import { issueWalletToken } from './auth/jwt';
+import { createRequireAuth, WalletAuthRequest } from './auth/middleware';
 
 declare global {
   namespace Express {
@@ -73,8 +78,40 @@ function parseFields(req: Request) {
 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
+/** Validate that a string is a valid Stellar ed25519 public key (G…). */
+function isValidStellarAddress(addr: unknown): addr is string {
+  return typeof addr === 'string' && StrKey.isValidEd25519PublicKey(addr);
+}
+
+/** Authenticated wallet address, if the request carried a valid bearer token. */
+const callerOf = (req: Request): string | undefined => (req as WalletAuthRequest).auth?.address;
+
 /** Dependencies that can be injected via createApp's first argument. */
-export type AppDeps = { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader; txRpcServer?: RpcClient };
+export type AppDeps = {
+  logger?: Logger;
+  store?: EscrowStore;
+  chainReader?: ChainReader;
+  txRpcServer?: RpcClient;
+  /** Secret for wallet-auth challenges and JWTs. Passing it enforces auth unless `authRequired: false`. */
+  authSecret?: string;
+  /** Force wallet auth on (true) or off (false) for mutating routes. */
+  authRequired?: boolean;
+  /** Injectable clock for auth (tests). */
+  now?: () => number;
+};
+
+/**
+ * Wallet auth is enforced when a secret is configured (AUTH_SECRET or the
+ * `authSecret` dep) or AUTH_REQUIRED=true. Without a secret a random
+ * per-process one is used so the challenge/token flow still works, and
+ * unauthenticated requests keep the legacy behaviour.
+ */
+function resolveAuth(deps: AppDeps) {
+  const configured = deps.authSecret ?? process.env.AUTH_SECRET;
+  const secret = configured || randomBytes(32).toString('base64');
+  const required = deps.authRequired ?? (Boolean(configured) || process.env.AUTH_REQUIRED === 'true');
+  return { secret, required, now: deps.now ?? Date.now };
+}
 
 function resolveStoreAndLogger(
   storeOrOpts: EscrowStore | AppDeps = new EscrowStore().seed(),
@@ -111,6 +148,9 @@ export function createApp(
   const logger = resolved.logger;
   const chainReader = fallbackChainReader ?? resolved.chainReader;
   const txRpcServer = resolved.txRpcServer;
+  const isDeps = !(storeOrOpts && typeof (storeOrOpts as EscrowStore).list === 'function');
+  const auth = resolveAuth(isDeps ? ((storeOrOpts as AppDeps | undefined) ?? {}) : {});
+  const requireAuth = createRequireAuth(auth.secret, auth.now, auth.required);
 
   const app = express();
   app.disable('x-powered-by');
@@ -202,6 +242,8 @@ export function createApp(
         'GET  /api/v1/contracts/:id/parity',
         'GET  /api/v1/reputation/:address',
         'GET  /api/v1/reputation/:address/reviews',
+        'GET  /api/v1/auth/challenge',
+        'POST /api/v1/auth/token',
       ],
     })),
   );
@@ -231,6 +273,56 @@ export function createApp(
       required: options.idempotencyRequired ?? process.env.IDEMPOTENCY_REQUIRED === 'true',
     }),
   );
+  // --- Wallet-signature auth (public) ---
+
+  // GET /api/v1/auth/challenge?address=G...
+  v1.get(
+    '/auth/challenge',
+    wrap((req) => {
+      const address = req.query.address;
+      if (!isValidStellarAddress(address)) {
+        throw new HttpError(400, 'invalid_address', 'address must be a valid Stellar G… public key');
+      }
+      const { challenge, expiresAt } = buildChallenge(address, auth.secret, auth.now);
+      return { address, challenge, expiresAt };
+    }),
+  );
+
+  // POST /api/v1/auth/token  { address, challenge, signature }
+  v1.post(
+    '/auth/token',
+    wrap((req) => {
+      const { address, challenge, signature } = req.body ?? {};
+      if (!isValidStellarAddress(address)) {
+        throw new HttpError(400, 'invalid_address', 'address must be a valid Stellar G… public key');
+      }
+      if (typeof challenge !== 'string' || !challenge) {
+        throw new HttpError(400, 'invalid_challenge', 'challenge is required');
+      }
+      if (typeof signature !== 'string' || !signature) {
+        throw new HttpError(400, 'invalid_signature', 'signature is required');
+      }
+
+      // Verify the challenge HMAC, expiry, address match, and replay.
+      const result = verifyChallenge(challenge, address, auth.secret, auth.now);
+      if (!result.ok) throw new HttpError(401, result.error, 'Challenge verification failed');
+
+      // Verify the ed25519 signature over the exact challenge string.
+      let sigValid = false;
+      try {
+        sigValid = Keypair.fromPublicKey(address).verify(Buffer.from(challenge, 'utf-8'), Buffer.from(signature, 'base64'));
+      } catch {
+        sigValid = false;
+      }
+      if (!sigValid) throw new HttpError(401, 'invalid_signature', 'Signature verification failed');
+
+      // Mark the nonce as consumed so the challenge can't be replayed in this process.
+      consumeNonce(result.payload.nonce);
+      const { token, expiresAt } = issueWalletToken(address, auth.secret, auth.now);
+      return { token, tokenType: 'Bearer', expiresAt };
+    }),
+  );
+
   v1.get(
     '/chain',
     wrap(() => ({
@@ -265,6 +357,20 @@ export function createApp(
   );
   v1.post(
     '/contracts',
+    requireAuth,
+    (req, _res, next) => {
+      // With wallet auth the client is the authenticated address: reject a
+      // different body.client and default it when omitted.
+      const caller = callerOf(req);
+      if (caller !== undefined) {
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        if (body.client !== undefined && body.client !== caller) {
+          return next(new HttpError(403, 'forbidden', 'Authenticated address must match contract client'));
+        }
+        req.body = { ...body, client: caller };
+      }
+      next();
+    },
     validate({ body: CreateContractBody }),
     wrap((req, res) => {
       res.status(201).json(store.create(req.body));
@@ -275,29 +381,46 @@ export function createApp(
     validate({ params: IdParam }),
     wrap((req) => project(store.get(Number(req.params.id)), parseFields(req))),
   );
-  v1.patch('/contracts/:id', wrap((req) => store.edit(id(req), req.body ?? {})));
+  // With wallet auth the authenticated address stands in for body.client.
+  const clientOf = (req: Request): unknown => {
+    const caller = callerOf(req);
+    if (caller === undefined) return req.body?.client;
+    if (req.body?.client !== undefined && req.body.client !== caller) {
+      throw new HttpError(403, 'forbidden', 'Authenticated address must match contract client');
+    }
+    return caller;
+  };
+  v1.patch(
+    '/contracts/:id',
+    requireAuth,
+    wrap((req) => store.edit(id(req), { ...(req.body ?? {}), client: clientOf(req) })),
+  );
   v1.delete(
     '/contracts/:id',
+    requireAuth,
     wrap((req, res) => {
-      store.delete(id(req), req.body?.client);
+      store.delete(id(req), clientOf(req));
       res.status(204).end();
     }),
   );
   v1.get('/contracts/:id/revisions', wrap((req) => store.getRevisions(id(req))));
   v1.post(
     '/contracts/:id/deposit',
+    requireAuth,
     validate({ params: IdParam, body: DepositBody }),
-    wrap((req) => store.deposit(Number(req.params.id), req.body.amount)),
+    wrap((req) => store.deposit(Number(req.params.id), req.body.amount, callerOf(req))),
   );
   v1.post(
     '/contracts/:id/milestones/:index/release',
+    requireAuth,
     validate({ params: MilestoneReleaseParams }),
-    wrap((req) => store.release(Number(req.params.id), Number(req.params.index))),
+    wrap((req) => store.release(Number(req.params.id), Number(req.params.index), callerOf(req))),
   );
   v1.post(
     '/contracts/:id/dispute',
+    requireAuth,
     validate({ params: IdParam, body: DisputeBody }),
-    wrap((req) => store.openDispute(Number(req.params.id), req.body.raisedBy, req.body.reason)),
+    wrap((req) => store.openDispute(Number(req.params.id), req.body.raisedBy, req.body.reason, callerOf(req))),
   );
   v1.post(
     '/contracts/:id/resolve',
@@ -306,13 +429,15 @@ export function createApp(
   );
   v1.post(
     '/contracts/:id/cancel',
+    requireAuth,
     validate({ params: IdParam, body: CancelBody }),
-    wrap((req) => store.cancel(Number(req.params.id))),
+    wrap((req) => store.cancel(Number(req.params.id), callerOf(req))),
   );
   v1.post(
     '/contracts/:id/reputation',
+    requireAuth,
     validate({ params: IdParam, body: RateBody }),
-    wrap((req) => store.rate(Number(req.params.id), req.body.rating)),
+    wrap((req) => store.rate(Number(req.params.id), req.body.rating, callerOf(req))),
   );
   v1.get(
     '/reputation/:address',
@@ -321,8 +446,14 @@ export function createApp(
   );
   v1.post(
     '/contracts/:id/reviews',
+    requireAuth,
     wrap((req, res) => {
-      res.status(201).json(store.createReview(id(req), req.body ?? {}));
+      const body = req.body ?? {};
+      const caller = callerOf(req);
+      if (caller !== undefined && body.reviewer !== undefined && body.reviewer !== caller) {
+        throw new HttpError(403, 'forbidden', 'reviewer must match the authenticated address');
+      }
+      res.status(201).json(store.createReview(id(req), caller === undefined ? body : { ...body, reviewer: caller }));
     }),
   );
   v1.post(

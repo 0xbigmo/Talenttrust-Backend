@@ -345,13 +345,26 @@ export class EscrowStore {
     }
   }
 
+  /**
+   * Party check used when the request is authenticated (wallet auth). Mirrors
+   * the contract's `require_auth()` rules. `caller === undefined` means the
+   * request was not authenticated (auth disabled) and keeps legacy behaviour.
+   */
+  private requireClient(c: InternalContract, caller: string | undefined, action: string) {
+    if (caller !== undefined && caller !== c.client) {
+      throw new HttpError(403, 'forbidden', `Only the contract client can ${action}`);
+    }
+  }
+
   private touch(c: InternalContract): EscrowContract {
     c.updatedAt = new Date().toISOString();
     return toPublic(c);
   }
 
-  deposit(id: number, amountRaw: unknown): EscrowContract {
+  /** @security when `caller` is given it must equal contract.client — mirrors deposit_funds's client.require_auth() */
+  deposit(id: number, amountRaw: unknown, caller?: string): EscrowContract {
     const c = this.getInternal(id);
+    this.requireClient(c, caller, 'deposit');
     this.requireActive(c);
 
     const amount = parseAmount(amountRaw, 'amount');
@@ -365,8 +378,10 @@ export class EscrowStore {
     return this.touch(c);
   }
 
-  release(id: number, index: number): EscrowContract {
+  /** @security when `caller` is given it must equal contract.client — mirrors release_milestone's client.require_auth() */
+  release(id: number, index: number, caller?: string): EscrowContract {
     const c = this.getInternal(id);
+    this.requireClient(c, caller, 'release milestones');
     this.requireActive(c);
     const m = c.milestones[index];
     if (!m) throw new HttpError(404, 'milestone_not_found', `Milestone ${index} not found`);
@@ -382,9 +397,23 @@ export class EscrowStore {
     return this.touch(c);
   }
 
-  openDispute(id: number, raisedBy: unknown, reason: unknown): EscrowContract {
+  /**
+   * @security when `caller` (authenticated address) is given it must be the
+   * client or freelancer — mirrors caller.require_auth(). A body `raisedBy` is
+   * accepted for backwards compatibility but rejected (403) if it differs.
+   */
+  openDispute(id: number, raisedByRaw: unknown, reason: unknown, caller?: string): EscrowContract {
     const c = this.getInternal(id);
-    if (raisedBy !== c.client && raisedBy !== c.freelancer) {
+    let raisedBy = raisedByRaw;
+    if (caller !== undefined) {
+      if (caller !== c.client && caller !== c.freelancer) {
+        throw new HttpError(403, 'forbidden', 'Only the client or freelancer can open a dispute');
+      }
+      if (raisedByRaw !== undefined && raisedByRaw !== caller) {
+        throw new HttpError(403, 'forbidden', 'raisedBy must match the authenticated address');
+      }
+      raisedBy = caller;
+    } else if (raisedBy !== c.client && raisedBy !== c.freelancer) {
       throw new HttpError(403, 'unauthorized', 'Only the client or freelancer can open a dispute');
     }
     this.requireActive(c);
@@ -421,8 +450,10 @@ export class EscrowStore {
     return this.touch(c);
   }
 
-  cancel(id: number): EscrowContract {
+  /** @security when `caller` is given it must equal contract.client — mirrors cancel_contract's client.require_auth() */
+  cancel(id: number, caller?: string): EscrowContract {
     const c = this.getInternal(id);
+    this.requireClient(c, caller, 'cancel');
     this.requireActive(c);
     c.status = 'Cancelled';
     return this.touch(c);
@@ -505,8 +536,10 @@ export class EscrowStore {
     return review;
   }
 
-  rate(id: number, ratingRaw: unknown): Reputation {
+  /** @security when `caller` is given it must equal contract.client — mirrors issue_reputation's client.require_auth() */
+  rate(id: number, ratingRaw: unknown, caller?: string): Reputation {
     const c = this.getInternal(id);
+    this.requireClient(c, caller, 'issue reputation');
     if (c.status !== 'Completed') {
       throw new HttpError(409, 'invalid_status', 'Only completed contracts can issue reputation');
     }

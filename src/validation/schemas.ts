@@ -66,7 +66,7 @@ export const DepositBody = z
 
 export const DisputeBody = z
   .object({
-    raisedBy: z.string().min(1),
+    raisedBy: z.string().min(1).optional(),
     reason: z.string().min(1).max(1000).optional(),
   })
   .strict();
