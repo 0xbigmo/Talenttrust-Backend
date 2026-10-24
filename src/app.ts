@@ -27,8 +27,9 @@ const wrap = (fn: Handler) => async (req: Request, res: Response, next: NextFunc
     const out = await fn(req, res);
     if (out !== undefined && !res.headersSent) {
       // Use bigIntReplacer so bigint amounts serialise as decimal strings
-      // and JSON.stringify never throws on a response.
-      res.type('json').send(JSON.stringify(out, bigIntReplacer));
+      // and JSON.stringify never throws on a response. Go through res.json so
+      // middleware that wraps it (idempotency replay) still sees the body.
+      res.json(JSON.parse(JSON.stringify(out, bigIntReplacer)));
     }
   } catch (err) {
     next(err);
