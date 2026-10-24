@@ -22,6 +22,7 @@ import {
 import { parseFieldSpec, project } from './utils/project';
 import { createLogger, type Logger, randomUUID } from './logger';
 import { ChainReader, SorobanRpcChainReader } from './chain';
+import { buildEscrowTransaction, TxBuildError, type RpcClient } from './stellar/escrowTxBuilder';
 import { bigIntReplacer } from './amount';
 
 declare global {
@@ -72,9 +73,12 @@ function parseFields(req: Request) {
 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
+/** Dependencies that can be injected via createApp's first argument. */
+export type AppDeps = { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader; txRpcServer?: RpcClient };
+
 function resolveStoreAndLogger(
-  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
-): { store: EscrowStore; logger: Logger; chainReader: ChainReader } {
+  storeOrOpts: EscrowStore | AppDeps = new EscrowStore().seed(),
+): { store: EscrowStore; logger: Logger; chainReader: ChainReader; txRpcServer?: RpcClient } {
   if (
     storeOrOpts &&
     typeof storeOrOpts === 'object' &&
@@ -83,11 +87,12 @@ function resolveStoreAndLogger(
   ) {
     return { store: storeOrOpts as EscrowStore, logger: createLogger(), chainReader: new SorobanRpcChainReader() };
   }
-  const opts = (storeOrOpts as { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } | undefined) ?? {};
+  const opts = (storeOrOpts as AppDeps | undefined) ?? {};
   return {
     store: opts.store ?? new EscrowStore().seed(),
     logger: opts.logger ?? createLogger(),
     chainReader: opts.chainReader ?? new SorobanRpcChainReader(),
+    txRpcServer: opts.txRpcServer,
   };
 }
 
@@ -97,7 +102,7 @@ export interface AppOptions {
 }
 
 export function createApp(
-  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
+  storeOrOpts: EscrowStore | AppDeps = new EscrowStore().seed(),
   fallbackChainReader?: ChainReader,
   options: AppOptions = {},
 ) {
@@ -105,6 +110,7 @@ export function createApp(
   const store = resolved.store;
   const logger = resolved.logger;
   const chainReader = fallbackChainReader ?? resolved.chainReader;
+  const txRpcServer = resolved.txRpcServer;
 
   const app = express();
   app.disable('x-powered-by');
@@ -178,6 +184,7 @@ export function createApp(
         'GET  /openapi.json',
         'GET  /api/v1/chain',
         'GET  /api/v1/stats',
+        'POST /api/v1/tx/build',
         'GET  /api/v1/contracts',
         'POST /api/v1/contracts',
         'GET  /api/v1/contracts/:id',
@@ -232,6 +239,12 @@ export function createApp(
       contractId: config.contractId,
       explorer: explorerUrl(),
     })),
+  );
+  v1.post(
+    '/tx/build',
+    wrap(async (req) =>
+      buildEscrowTransaction(req.body, txRpcServer ? { server: txRpcServer } : {}),
+    ),
   );
   v1.get('/stats', wrap(() => store.stats()));
   v1.get(
@@ -345,6 +358,17 @@ export function createApp(
     const requestId = req.id;
     if (err instanceof HttpError) {
       res.status(err.status).json({ error: err.code, message: err.message, ...err.details, requestId });
+      return;
+    }
+    if (err instanceof TxBuildError) {
+      res
+        .status(err.status)
+        .json({
+          error: err.code,
+          message: err.message,
+          ...(err.contractError ? { contractError: err.contractError } : {}),
+          requestId,
+        });
       return;
     }
     if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
