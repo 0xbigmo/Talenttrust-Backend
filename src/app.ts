@@ -44,6 +44,8 @@ const id = (req: Request) => {
   return n;
 };
 
+const optionalString = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : undefined);
+
 /**
  * Parse the `?fields=` query param.  Returns `null` when the param is absent
  * (meaning "return all fields").  Throws {@link HttpError} 400 on invalid input.
@@ -174,9 +176,11 @@ export function createApp(
         'POST /api/v1/contracts/:id/resolve',
         'POST /api/v1/contracts/:id/cancel',
         'POST /api/v1/contracts/:id/reputation',
+        'POST /api/v1/contracts/:id/reviews',
         'POST /api/v1/contracts/:id/link',
         'GET  /api/v1/contracts/:id/parity',
         'GET  /api/v1/reputation/:address',
+        'GET  /api/v1/reputation/:address/reviews',
       ],
     })),
   );
@@ -263,6 +267,12 @@ export function createApp(
   v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
   v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
   v1.post(
+    '/contracts/:id/reviews',
+    wrap((req, res) => {
+      res.status(201).json(store.createReview(id(req), req.body ?? {}));
+    }),
+  );
+  v1.post(
     '/contracts/:id/link',
     wrap(async (req) => store.linkEscrow(id(req), req.body?.escrowId, chainReader)),
   );
@@ -270,7 +280,21 @@ export function createApp(
     '/contracts/:id/parity',
     wrap(async (req) => store.checkParity(id(req), chainReader)),
   );
-  v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
+  v1.get('/reputation/:address', wrap((req) => store.getReputationWithClient(req.params.address)));
+  v1.get(
+    '/reputation/:address/reviews',
+    wrap((req) => {
+      const limitRaw = req.query.limit;
+      const limit = typeof limitRaw === 'string' ? Number(limitRaw) : undefined;
+      const cursorRaw = req.query.cursor;
+      const cursor = typeof cursorRaw === 'string' ? Number(cursorRaw) : undefined;
+      return store.listReviews(req.params.address, {
+        role: optionalString(req.query.role),
+        limit: Number.isFinite(limit as number) ? (limit as number) : undefined,
+        cursor: Number.isFinite(cursor as number) ? cursor : undefined,
+      });
+    }),
+  );
   app.use('/api/v1', v1);
 
   app.use((req, res) => {

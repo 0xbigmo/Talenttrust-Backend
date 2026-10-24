@@ -97,6 +97,20 @@ export interface Reputation {
   averageRating: number;
 }
 
+export type ReviewRole = 'client_to_freelancer' | 'freelancer_to_client';
+
+export interface Review {
+  id: number;
+  contractId: number;
+  reviewer: string;
+  reviewee: string;
+  role: ReviewRole;
+  rating: number;
+  comment?: string;
+  context?: 'disputed';
+  createdAt: string;
+}
+
 /** Internal store record — keeps bigints for arithmetic. */
 interface InternalContract {
   id: number;
@@ -197,6 +211,9 @@ function toPublic(c: InternalContract): EscrowContract {
 export class EscrowStore {
   private contracts = new Map<number, InternalContract>();
   private reputation = new Map<string, { completed: number; total: number }>();
+  private clientReputation = new Map<string, { completed: number; total: number }>();
+  private reviews: Review[] = [];
+  private nextReviewId = 1;
   private nextId = 1;
 
   list(filter: { status?: string; party?: string; linked?: boolean } = {}): EscrowContract[] {
@@ -411,6 +428,83 @@ export class EscrowStore {
     return this.touch(c);
   }
 
+  private validateComment(commentRaw: unknown): string | undefined {
+    if (commentRaw === undefined || commentRaw === null) return undefined;
+    if (typeof commentRaw !== 'string') {
+      throw new HttpError(400, 'invalid_comment', 'comment must be a string');
+    }
+    const trimmed = commentRaw.trim();
+    if (trimmed.length > 1000) {
+      throw new HttpError(400, 'invalid_comment', 'comment must be at most 1000 characters');
+    }
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f]/.test(trimmed)) {
+      throw new HttpError(400, 'invalid_comment', 'comment must not contain control characters');
+    }
+    return trimmed.length ? trimmed : undefined;
+  }
+
+  private validateRating(ratingRaw: unknown): number {
+    const rating = Number(ratingRaw);
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      throw new HttpError(400, 'invalid_rating', 'rating must be an integer from 1 to 5');
+    }
+    return rating;
+  }
+
+  private applyReputation(
+    map: Map<string, { completed: number; total: number }>,
+    address: string,
+    rating: number,
+  ) {
+    const r = map.get(address) ?? { completed: 0, total: 0 };
+    r.completed += 1;
+    r.total += rating;
+    map.set(address, r);
+  }
+
+  createReview(
+    id: number,
+    input: { reviewer?: unknown; rating?: unknown; comment?: unknown },
+  ): Review {
+    const c = this.getInternal(id);
+    const { reviewer } = input;
+    if (reviewer !== c.client && reviewer !== c.freelancer) {
+      throw new HttpError(403, 'forbidden', 'Only the client or freelancer can review this contract');
+    }
+    if (c.status !== 'Completed' && c.status !== 'Resolved') {
+      throw new HttpError(409, 'invalid_status', `Contract is ${c.status}`);
+    }
+    const role: ReviewRole =
+      reviewer === c.client ? 'client_to_freelancer' : 'freelancer_to_client';
+    if (this.reviews.some((r) => r.contractId === id && r.role === role)) {
+      throw new HttpError(409, 'already_reviewed', 'Review already submitted for this direction');
+    }
+    const rating = this.validateRating(input.rating);
+    const comment = this.validateComment(input.comment);
+    const reviewee = role === 'client_to_freelancer' ? c.freelancer : c.client;
+    const review: Review = {
+      id: this.nextReviewId++,
+      contractId: id,
+      reviewer: reviewer as string,
+      reviewee,
+      role,
+      rating,
+      createdAt: new Date().toISOString(),
+    };
+    if (comment !== undefined) review.comment = comment;
+    if (c.status === 'Resolved') review.context = 'disputed';
+    this.reviews.push(review);
+    if (role === 'client_to_freelancer') {
+      this.applyReputation(this.reputation, c.freelancer, rating);
+      c.reputationIssued = true;
+    } else {
+      this.applyReputation(this.clientReputation, c.client, rating);
+    }
+    this.touch(c);
+    return review;
+  }
+
   rate(id: number, ratingRaw: unknown): Reputation {
     const c = this.getInternal(id);
     if (c.status !== 'Completed') {
@@ -419,16 +513,8 @@ export class EscrowStore {
     if (c.reputationIssued) {
       throw new HttpError(409, 'reputation_already_issued', 'Reputation already issued for this contract');
     }
-    const rating = Number(ratingRaw);
-    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
-      throw new HttpError(400, 'invalid_rating', 'rating must be an integer from 1 to 5');
-    }
-    const r = this.reputation.get(c.freelancer) ?? { completed: 0, total: 0 };
-    r.completed += 1;
-    r.total += rating;
-    this.reputation.set(c.freelancer, r);
-    c.reputationIssued = true;
-    this.touch(c);
+    const rating = this.validateRating(ratingRaw);
+    this.createReview(id, { reviewer: c.client, rating });
     return this.getReputation(c.freelancer);
   }
 
@@ -595,6 +681,20 @@ export class EscrowStore {
     };
   }
 
+  getReputationWithClient(address: string): Reputation & {
+    asClient: { completedContracts: number; averageRating: number };
+  } {
+    const base = this.getReputation(address);
+    const cr = this.clientReputation.get(address) ?? { completed: 0, total: 0 };
+    return {
+      ...base,
+      asClient: {
+        completedContracts: cr.completed,
+        averageRating: cr.completed ? Math.round((cr.total / cr.completed) * 100) / 100 : 0,
+      },
+    };
+  }
+
   stats() {
     const all = [...this.contracts.values()];
     const byStatus: Record<string, number> = {};
@@ -618,6 +718,22 @@ export class EscrowStore {
       totalReleased: Number(totalReleasedBig),
       totalReleasedUnits: totalReleasedBig.toString(),
     };
+  }
+
+  listReviews(
+    address: string,
+    filter: { role?: string; limit?: number; cursor?: number } = {},
+  ): { reviews: Review[]; nextCursor: number | null } {
+    const limit = filter.limit && filter.limit > 0 ? Math.min(filter.limit, 100) : 20;
+    const all = this.reviews
+      .filter((r) => r.reviewee === address)
+      .filter((r) => !filter.role || r.role === filter.role)
+      .sort((a, b) => b.id - a.id);
+    const cursor = filter.cursor;
+    const start = cursor ? all.findIndex((r) => r.id < cursor) : 0;
+    const slice = all.slice(start < 0 ? 0 : start, start < 0 ? 0 : start + limit);
+    const nextCursor = start < 0 ? null : start + limit < all.length ? slice[slice.length - 1]?.id ?? null : null;
+    return { reviews: slice, nextCursor };
   }
 
   /** Seed a few demo engagements so the API is explorable out of the box. */

@@ -36,10 +36,27 @@ data is per-instance and resets on redeploy.
 | POST | `/api/v1/contracts/:id/dispute` | `{ "raisedBy": "G...", "reason": "..." }` |
 | POST | `/api/v1/contracts/:id/resolve` | `{ "freelancerBps": 5000 }` |
 | POST | `/api/v1/contracts/:id/cancel` | Cancel and refund |
-| POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` |
+| POST | `/api/v1/contracts/:id/reputation` | Client rates freelancer: `{ "rating": 5 }` (backward-compatible) |
+| POST | `/api/v1/contracts/:id/reviews` | Two-sided review: `{ "reviewer": "G...", "rating": 5, "comment": "..." }` |
 | POST | `/api/v1/contracts/:id/link` | Link to on-chain escrow `{ "escrowId": "3" }` |
 | GET | `/api/v1/contracts/:id/parity` | Parity check report against on-chain state |
-| GET | `/api/v1/reputation/:address` | Freelancer reputation |
+| GET | `/api/v1/reputation/:address` | Reputation (freelancer fields + `asClient`) |
+| GET | `/api/v1/reputation/:address/reviews` | Reviews received (`?role=`, `?limit=`, `?cursor=`) |
+
+## Reviews
+
+Reviews are per-contract and two-sided: a client can rate a freelancer and a freelancer can
+rate a client. Each direction is allowed once per contract and only after the contract reaches
+`Completed` or `Resolved`. Reviews of `Resolved` contracts carry `context: 'disputed'`.
+
+- `role` is derived from the reviewer: client → freelancer is `client_to_freelancer`, freelancer → client is
+  `freelancer_to_client`.
+- `comment` is optional, trimmed, at most 1000 characters, and must not contain control characters.
+- Reviews are immutable (no edit/delete).
+
+The legacy `POST /api/v1/contracts/:id/reputation` endpoint is equivalent to a client review of the
+freelancer without a comment and still sets `reputationIssued`. A following client `POST /reviews` for the
+same contract returns `409 already_reviewed`.
 
 ## Sparse fieldsets
 
