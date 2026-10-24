@@ -10,6 +10,28 @@ const errorResponse = (description: string, schema: object = { $ref: '#/componen
 });
 const idParam = { name: 'id', in: 'path', required: true, schema: { type: 'integer' } };
 const contractRef = { $ref: '#/components/schemas/EscrowContract' };
+const amountSchema = {
+  oneOf: [{ type: 'integer', minimum: 1 }, { type: 'string', pattern: '^[1-9][0-9]{0,37}$' }],
+  description: 'Amount in token base units. Must be a positive integer.',
+};
+const milestonesSchema = {
+  type: 'array',
+  minItems: 1,
+  maxItems: 20,
+  items: {
+    oneOf: [
+      amountSchema,
+      {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          amount: amountSchema,
+        },
+        required: ['amount'],
+      },
+    ],
+  },
+};
 
 const spec = {
   openapi: '3.0.3',
@@ -53,18 +75,89 @@ const spec = {
               client: { type: 'string' },
               freelancer: { type: 'string' },
               token: { type: 'string', default: 'XLM' },
-              milestones: {
-                type: 'array',
-                items: { type: 'object', properties: { title: { type: 'string' }, amount: { oneOf: [{ type: 'integer', minimum: 1 }, { type: 'string', pattern: '^[1-9][0-9]{0,37}$' }], description: 'Amount in token base units. Must be a positive integer.' } } },
-              },
+              milestones: milestonesSchema,
             },
           }),
         },
-        responses: { 201: { description: 'Created', content: json(contractRef) } },
+        responses: {
+          201: { description: 'Created', content: json(contractRef) },
+          400: errorResponse('Invalid contract input'),
+        },
       },
     },
     '/api/v1/contracts/{id}': {
-      get: { tags: ['Contracts'], summary: 'Get a contract', parameters: [idParam], responses: ok('Contract', contractRef) },
+      get: {
+        tags: ['Contracts'],
+        summary: 'Get a contract',
+        parameters: [idParam],
+        responses: {
+          ...ok('Contract', contractRef),
+          400: errorResponse('Invalid contract id'),
+          404: errorResponse('Contract not found'),
+        },
+      },
+      patch: {
+        tags: ['Contracts'],
+        summary: 'Edit an unfunded contract',
+        description: 'Only the matching client can edit a contract while it is Created and has received no funds.',
+        parameters: [idParam],
+        requestBody: {
+          required: true,
+          content: json({
+            type: 'object',
+            required: ['client'],
+            minProperties: 2,
+            properties: {
+              client: { type: 'string' },
+              title: { type: 'string' },
+              milestones: milestonesSchema,
+            },
+          }),
+        },
+        responses: {
+          ...ok('Updated contract', contractRef),
+          400: errorResponse('Empty patch, invalid contract id, or invalid milestones'),
+          403: errorResponse('Client does not own the contract'),
+          404: errorResponse('Contract not found'),
+          409: errorResponse('Contract is funded or no longer editable'),
+        },
+      },
+      delete: {
+        tags: ['Contracts'],
+        summary: 'Withdraw an unfunded contract',
+        description: 'Only the matching client can withdraw a contract while it is Created and has received no funds.',
+        parameters: [idParam],
+        requestBody: {
+          required: true,
+          content: json({
+            type: 'object',
+            required: ['client'],
+            properties: { client: { type: 'string' } },
+          }),
+        },
+        responses: {
+          204: { description: 'Contract withdrawn' },
+          400: errorResponse('Invalid contract id'),
+          403: errorResponse('Client does not own the contract'),
+          404: errorResponse('Contract not found'),
+          409: errorResponse('Contract is funded or no longer withdrawable'),
+        },
+      },
+    },
+    '/api/v1/contracts/{id}/revisions': {
+      get: {
+        tags: ['Contracts'],
+        summary: 'Get contract term revision history',
+        parameters: [idParam],
+        responses: {
+          ...ok('Revision history', {
+            type: 'array',
+            items: { $ref: '#/components/schemas/ContractRevision' },
+          }),
+          400: errorResponse('Invalid contract id'),
+          404: errorResponse('Contract not found'),
+        },
+      },
     },
     '/api/v1/contracts/{id}/deposit': {
       post: {
@@ -310,8 +403,29 @@ const spec = {
           status: { type: 'string', enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'] },
           reputationIssued: { type: 'boolean' },
           chain: { $ref: '#/components/schemas/ChainInfo' },
+          revision: { type: 'integer', minimum: 1, description: 'Term revision; increments on every edit.' },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      ContractRevision: {
+        type: 'object',
+        required: ['revision', 'at', 'changes'],
+        properties: {
+          revision: { type: 'integer', minimum: 2 },
+          at: { type: 'string', format: 'date-time' },
+          changes: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['field', 'from', 'to'],
+              properties: {
+                field: { type: 'string', enum: ['title', 'milestones'] },
+                from: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'object' } }] },
+                to: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'object' } }] },
+              },
+            },
+          },
         },
       },
     },

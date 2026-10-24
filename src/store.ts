@@ -78,8 +78,16 @@ export interface EscrowContract {
   reputationIssued: boolean;
   dispute?: Dispute;
   chain?: ChainInfo;
+  /** Term revision number; starts at 1 and increments on every edit. */
+  revision: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ContractRevision {
+  revision: number;
+  at: string;
+  changes: Array<{ field: 'title' | 'milestones'; from: unknown; to: unknown }>;
 }
 
 export interface Reputation {
@@ -109,12 +117,57 @@ interface InternalContract {
   reputationIssued: boolean;
   dispute?: Dispute;
   chain?: ChainInfo;
+  revision: number;
+  revisions: ContractRevision[];
   createdAt: string;
   updatedAt: string;
 }
 
 const MAX_MILESTONES = 20;
+const MAX_REVISIONS = 50;
 const ACTIVE: ContractStatus[] = ['Created', 'Funded'];
+
+/** Validate a milestones array into internal (bigint) milestones. */
+function parseMilestones(input: unknown): InternalContract['milestones'] {
+  if (!Array.isArray(input) || input.length === 0) {
+    throw new HttpError(400, 'invalid_milestones', 'milestones must be a non-empty array');
+  }
+  if (input.length > MAX_MILESTONES) {
+    throw new HttpError(400, 'invalid_milestones', `at most ${MAX_MILESTONES} milestones`);
+  }
+  return input.map((m: unknown, index: number) => {
+    const raw =
+      typeof m === 'number' || typeof m === 'string' || typeof m === 'boolean'
+        ? { amount: m }
+        : ((m ?? {}) as { title?: unknown; amount?: unknown });
+    const amount = parseAmount(raw.amount, `milestone ${index} amount`);
+    return {
+      index,
+      title: typeof raw.title === 'string' && raw.title ? raw.title : `Milestone ${index + 1}`,
+      amount,
+      released: false,
+    };
+  });
+}
+
+/** Sum milestone amounts with overflow check (mirrors contract checked_add). */
+function sumMilestones(milestones: InternalContract['milestones']): bigint {
+  let total = 0n;
+  for (let i = 0; i < milestones.length; i++) {
+    total = checkedAdd(total, milestones[i].amount, `milestone ${i} amount`);
+  }
+  return total;
+}
+
+/** JSON-safe snapshot of milestones for revision history. */
+const publicMilestones = (milestones: InternalContract['milestones']): Milestone[] =>
+  milestones.map((m) => ({
+    index: m.index,
+    title: m.title,
+    amount: Number(m.amount),
+    amountUnits: m.amount.toString(),
+    released: m.released,
+  }));
 
 /** Project an internal contract to the public API shape. */
 function toPublic(c: InternalContract): EscrowContract {
@@ -124,13 +177,7 @@ function toPublic(c: InternalContract): EscrowContract {
     client: c.client,
     freelancer: c.freelancer,
     token: c.token,
-    milestones: c.milestones.map((m) => ({
-      index: m.index,
-      title: m.title,
-      amount: Number(m.amount),        // deprecated — lossy above 2^53
-      amountUnits: m.amount.toString(),
-      released: m.released,
-    })),
+    milestones: publicMilestones(c.milestones),
     totalAmount: Number(c.totalAmount),    // deprecated
     totalAmountUnits: c.totalAmount.toString(),
     fundedAmount: Number(c.fundedAmount),  // deprecated
@@ -141,6 +188,7 @@ function toPublic(c: InternalContract): EscrowContract {
     reputationIssued: c.reputationIssued,
     dispute: c.dispute,
     chain: c.chain,
+    revision: c.revision,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -186,36 +234,8 @@ export class EscrowStore {
     if (client === freelancer) {
       throw new HttpError(400, 'invalid_parties', 'client and freelancer must differ');
     }
-    if (!Array.isArray(input.milestones) || input.milestones.length === 0) {
-      throw new HttpError(400, 'invalid_milestones', 'milestones must be a non-empty array');
-    }
-    if (input.milestones.length > MAX_MILESTONES) {
-      throw new HttpError(400, 'invalid_milestones', `at most ${MAX_MILESTONES} milestones`);
-    }
-
-    const milestones: InternalContract['milestones'] = input.milestones.map(
-      (m: unknown, index: number) => {
-        const raw =
-          typeof m === 'number' || typeof m === 'string' || typeof m === 'boolean'
-            ? { amount: m }
-            : (m as { title?: unknown; amount?: unknown });
-        const amount = parseAmount(raw?.amount, `milestone ${index} amount`);
-        return {
-          index,
-          title: typeof (raw as { title?: unknown }).title === 'string' && (raw as { title?: unknown }).title
-            ? String((raw as { title?: unknown }).title)
-            : `Milestone ${index + 1}`,
-          amount,
-          released: false,
-        };
-      },
-    );
-
-    // Sum milestone amounts with overflow check (mirrors contract checked_add)
-    let totalAmount = 0n;
-    for (let i = 0; i < milestones.length; i++) {
-      totalAmount = checkedAdd(totalAmount, milestones[i].amount, `milestone ${i} amount`);
-    }
+    const milestones = parseMilestones(input.milestones);
+    const totalAmount = sumMilestones(milestones);
 
     const now = new Date().toISOString();
     const c: InternalContract = {
@@ -230,11 +250,76 @@ export class EscrowStore {
       releasedAmount: 0n,
       status: 'Created',
       reputationIssued: false,
+      revision: 1,
+      revisions: [],
       createdAt: now,
       updatedAt: now,
     };
     this.contracts.set(c.id, c);
     return toPublic(c);
+  }
+
+  edit(
+    id: number,
+    input: { client?: unknown; title?: unknown; milestones?: unknown },
+  ): EscrowContract {
+    const c = this.getInternal(id);
+    if (input.client !== c.client) {
+      throw new HttpError(403, 'forbidden', 'Only the client can edit this contract');
+    }
+    if (c.status !== 'Created' || c.fundedAmount !== 0n) {
+      throw new HttpError(409, 'contract_locked', 'Contract terms can only be edited before funding');
+    }
+    const hasTitle = Object.prototype.hasOwnProperty.call(input, 'title');
+    const hasMilestones = Object.prototype.hasOwnProperty.call(input, 'milestones');
+    if (!hasTitle && !hasMilestones) {
+      throw new HttpError(400, 'empty_patch', 'At least one of title or milestones must be provided');
+    }
+
+    const changes: ContractRevision['changes'] = [];
+    let title: string | undefined;
+    let milestones: InternalContract['milestones'] | undefined;
+    let totalAmount: bigint | undefined;
+    if (hasTitle) {
+      title = typeof input.title === 'string' && input.title ? input.title : 'Untitled engagement';
+      if (title !== c.title) changes.push({ field: 'title', from: c.title, to: title });
+    }
+    if (hasMilestones) {
+      milestones = parseMilestones(input.milestones);
+      totalAmount = sumMilestones(milestones);
+      const from = publicMilestones(c.milestones);
+      const to = publicMilestones(milestones);
+      if (JSON.stringify(from) !== JSON.stringify(to)) {
+        changes.push({ field: 'milestones', from, to });
+      }
+    }
+
+    const at = new Date().toISOString();
+    if (title !== undefined) c.title = title;
+    if (milestones && totalAmount !== undefined) {
+      c.milestones = milestones;
+      c.totalAmount = totalAmount;
+    }
+    c.revision += 1;
+    c.revisions.push({ revision: c.revision, at, changes });
+    if (c.revisions.length > MAX_REVISIONS) c.revisions.shift();
+    c.updatedAt = at;
+    return toPublic(c);
+  }
+
+  getRevisions(id: number): ContractRevision[] {
+    return this.getInternal(id).revisions;
+  }
+
+  delete(id: number, clientRaw: unknown): void {
+    const c = this.getInternal(id);
+    if (clientRaw !== c.client) {
+      throw new HttpError(403, 'forbidden', 'Only the client can withdraw this contract');
+    }
+    if (c.status !== 'Created' || c.fundedAmount !== 0n) {
+      throw new HttpError(409, 'contract_locked', 'Contract can only be withdrawn before funding');
+    }
+    this.contracts.delete(id);
   }
 
   private requireActive(c: InternalContract) {
